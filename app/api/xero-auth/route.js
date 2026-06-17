@@ -16,12 +16,15 @@ export async function GET() {
   }
 
   // Scopes needed: read/write invoices, read/write contacts, offline_access for refresh tokens
+  // Updated for Xero's granular scopes (required for all apps created after March 2, 2026)
   const scopes = [
     'openid',
     'profile',
     'email',
-    'accounting.transactions',
     'accounting.contacts',
+    'accounting.contacts.read',
+    'accounting.invoices',
+    'accounting.invoices.read',
     'offline_access',
   ].join(' ');
 
