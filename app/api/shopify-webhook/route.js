@@ -42,6 +42,16 @@ function verifyShopifyWebhook(rawBody, hmacHeader) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
   if (!secret) return true; // skip verification if not configured yet (set this up before going live)
   const generatedHash = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('base64');
+
+  // TEMPORARY DEBUG — remove once verification is confirmed working
+  console.log('--- HMAC DEBUG ---');
+  console.log('Secret length:', secret.length);
+  console.log('Secret first/last char codes:', secret.charCodeAt(0), secret.charCodeAt(secret.length - 1));
+  console.log('Header received:', hmacHeader);
+  console.log('Generated hash:', generatedHash);
+  console.log('Match:', generatedHash === hmacHeader);
+  console.log('------------------');
+
   return generatedHash === hmacHeader;
 }
 
