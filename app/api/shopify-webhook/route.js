@@ -121,7 +121,31 @@ async function findOrCreateContact(accessToken, tenantId, name, email) {
   const searchData = await searchResponse.json();
 
   if (searchData.Contacts && searchData.Contacts.length > 0) {
-    return searchData.Contacts[0].ContactID;
+    const existingContactId = searchData.Contacts[0].ContactID;
+    const existingName = searchData.Contacts[0].Name;
+
+    // If the name on file doesn't match, update it so old/bad data gets corrected
+    if (existingName !== name) {
+      const updateResponse = await fetch(`https://api.xero.com/api.xro/2.0/Contacts/${existingContactId}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Xero-tenant-id': tenantId,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          Contacts: [{ ContactID: existingContactId, Name: name }],
+        }),
+      });
+      if (!updateResponse.ok) {
+        const updateData = await updateResponse.json();
+        console.error('Failed to update contact name:', updateData);
+        // Don't throw — still proceed with invoice creation using existing contact
+      }
+    }
+
+    return existingContactId;
   }
 
   // Not found — create a new contact
@@ -185,33 +209,28 @@ export async function POST(request) {
     }
 
     // --- Build Xero line items from Shopify line items ---
+    // Uses Shopify's actual discount_allocations (the real, already-calculated
+    // dollar discount per line item) rather than recalculating from tags.
+    // This is more accurate since Shopify itself determined the discount amount.
     const lineItems = (order.line_items || []).map((item) => {
-      const isSurgical = (item.title || '').toLowerCase().includes('surgical guide');
       const isTaxable = item.taxable === true;
       const originalPrice = parseFloat(item.price) || 0;
+      const quantity = item.quantity || 1;
+      const lineSubtotal = originalPrice * quantity;
 
-      // Combine general + surgical discount into a single effective discount %
-      // (Xero's DiscountRate is a single percentage per line item, so fixed-dollar
-      // surgical discounts are converted to an equivalent % for that line.)
-      let combinedDiscountPct = 0;
-
-      if (generalDiscountPct > 0) {
-        combinedDiscountPct = generalDiscountPct;
+      // Sum all discount allocations for this line item (Shopify can apply multiple)
+      let discountAmount = 0;
+      if (Array.isArray(item.discount_allocations)) {
+        for (const alloc of item.discount_allocations) {
+          const amt = parseFloat(alloc.allocatedAmountSet?.shopMoney?.amount ?? alloc.amount ?? 0);
+          discountAmount += amt;
+        }
       }
 
-      if (isSurgical && surgicalDiscount) {
-        if (surgicalDiscount.type === 'percent') {
-          // Stack on top of general discount: 1 - (1-a)(1-b)
-          const a = combinedDiscountPct / 100;
-          const b = surgicalDiscount.value / 100;
-          combinedDiscountPct = Math.round((1 - (1 - a) * (1 - b)) * 10000) / 100;
-        } else {
-          // Fixed dollar amount — convert to equivalent % of original price
-          const fixedPct = originalPrice > 0 ? (surgicalDiscount.value / originalPrice) * 100 : 0;
-          const a = combinedDiscountPct / 100;
-          const b = fixedPct / 100;
-          combinedDiscountPct = Math.round((1 - (1 - a) * (1 - b)) * 10000) / 100;
-        }
+      // Convert dollar discount to a percentage rate for Xero's DiscountRate field
+      let discountRate = 0;
+      if (discountAmount > 0 && lineSubtotal > 0) {
+        discountRate = Math.round((discountAmount / lineSubtotal) * 10000) / 100; // 2 decimal places
       }
 
       let description = item.title || 'Item';
@@ -221,14 +240,14 @@ export async function POST(request) {
 
       const lineItem = {
         Description: description,
-        Quantity: item.quantity || 1,
-        UnitAmount: originalPrice, // full original price — Xero applies the discount itself
+        Quantity: quantity,
+        UnitAmount: originalPrice,
         AccountCode: isTaxable ? ACCOUNT_TAXABLE : ACCOUNT_GST_FREE,
         TaxType: isTaxable ? TAX_TYPE_TAXABLE : TAX_TYPE_GST_FREE,
       };
 
-      if (combinedDiscountPct > 0) {
-        lineItem.DiscountRate = combinedDiscountPct;
+      if (discountRate > 0) {
+        lineItem.DiscountRate = discountRate;
       }
 
       return lineItem;
@@ -247,12 +266,12 @@ export async function POST(request) {
     // populate order.customer (e.g. for POS, draft, or guest-style orders).
     let customerName = '';
 
-    if (order.customer?.first_name || order.customer?.last_name) {
-      customerName = `${order.customer.first_name || ''} ${order.customer.last_name || ''}`.trim();
+    if (order.shipping_address?.name) {
+      customerName = order.shipping_address.name.trim();
     } else if (order.billing_address?.name) {
       customerName = order.billing_address.name.trim();
-    } else if (order.shipping_address?.name) {
-      customerName = order.shipping_address.name.trim();
+    } else if (order.customer?.first_name || order.customer?.last_name) {
+      customerName = `${order.customer.first_name || ''} ${order.customer.last_name || ''}`.trim();
     } else if (order.email) {
       customerName = order.email.split('@')[0];
     } else {
