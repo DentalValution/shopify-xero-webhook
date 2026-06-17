@@ -190,34 +190,48 @@ export async function POST(request) {
       const isTaxable = item.taxable === true;
       const originalPrice = parseFloat(item.price) || 0;
 
-      let unitPrice = originalPrice;
+      // Combine general + surgical discount into a single effective discount %
+      // (Xero's DiscountRate is a single percentage per line item, so fixed-dollar
+      // surgical discounts are converted to an equivalent % for that line.)
+      let combinedDiscountPct = 0;
 
       if (generalDiscountPct > 0) {
-        unitPrice = unitPrice * (1 - generalDiscountPct / 100);
+        combinedDiscountPct = generalDiscountPct;
       }
 
       if (isSurgical && surgicalDiscount) {
         if (surgicalDiscount.type === 'percent') {
-          unitPrice = unitPrice * (1 - surgicalDiscount.value / 100);
+          // Stack on top of general discount: 1 - (1-a)(1-b)
+          const a = combinedDiscountPct / 100;
+          const b = surgicalDiscount.value / 100;
+          combinedDiscountPct = Math.round((1 - (1 - a) * (1 - b)) * 10000) / 100;
         } else {
-          unitPrice = unitPrice - surgicalDiscount.value;
+          // Fixed dollar amount — convert to equivalent % of original price
+          const fixedPct = originalPrice > 0 ? (surgicalDiscount.value / originalPrice) * 100 : 0;
+          const a = combinedDiscountPct / 100;
+          const b = fixedPct / 100;
+          combinedDiscountPct = Math.round((1 - (1 - a) * (1 - b)) * 10000) / 100;
         }
       }
-
-      unitPrice = Math.max(0, Math.round(unitPrice * 100) / 100);
 
       let description = item.title || 'Item';
       if (item.variant_title && item.variant_title !== 'Default Title') {
         description += ` — ${item.variant_title}`;
       }
 
-      return {
+      const lineItem = {
         Description: description,
         Quantity: item.quantity || 1,
-        UnitAmount: unitPrice,
+        UnitAmount: originalPrice, // full original price — Xero applies the discount itself
         AccountCode: isTaxable ? ACCOUNT_TAXABLE : ACCOUNT_GST_FREE,
         TaxType: isTaxable ? TAX_TYPE_TAXABLE : TAX_TYPE_GST_FREE,
       };
+
+      if (combinedDiscountPct > 0) {
+        lineItem.DiscountRate = combinedDiscountPct;
+      }
+
+      return lineItem;
     });
 
     if (lineItems.length === 0) {
@@ -229,15 +243,39 @@ export async function POST(request) {
     const tenantId = await redis.get('xero:tenant_id');
 
     // --- Find or create the Xero contact ---
-    const customerName =
-      `${order.customer?.first_name || ''} ${order.customer?.last_name || ''}`.trim() ||
-      order.billing_address?.name ||
-      'Shopify Customer';
+    // Try multiple sources in order of reliability, since Shopify doesn't always
+    // populate order.customer (e.g. for POS, draft, or guest-style orders).
+    let customerName = '';
+
+    if (order.customer?.first_name || order.customer?.last_name) {
+      customerName = `${order.customer.first_name || ''} ${order.customer.last_name || ''}`.trim();
+    } else if (order.billing_address?.name) {
+      customerName = order.billing_address.name.trim();
+    } else if (order.shipping_address?.name) {
+      customerName = order.shipping_address.name.trim();
+    } else if (order.email) {
+      customerName = order.email.split('@')[0];
+    } else {
+      customerName = 'Shopify Customer';
+    }
+
     const customerEmail = order.email || order.customer?.email || '';
+
+    // TEMPORARY DEBUG — remove once contact mapping is confirmed correct
+    console.log('--- CONTACT DEBUG ---');
+    console.log('order.customer:', JSON.stringify(order.customer));
+    console.log('order.billing_address?.name:', order.billing_address?.name);
+    console.log('order.tags:', order.tags);
+    console.log('Resolved customerName:', customerName);
+    console.log('Resolved customerEmail:', customerEmail);
+    console.log('----------------------');
 
     const contactId = await findOrCreateContact(accessToken, tenantId, customerName, customerEmail);
 
     // --- Create the invoice ---
+    const invoiceNumber = order.name || `#${order.order_number}`;
+    const invoiceReference = order.note || '';
+
     const invoicePayload = {
       Invoices: [
         {
@@ -250,8 +288,9 @@ export async function POST(request) {
                 .toISOString()
                 .split('T')[0]
             : undefined,
-          Reference: order.name || `#${order.order_number}`,
-          Status: 'AUTHORISED',
+          InvoiceNumber: invoiceNumber,
+          Reference: invoiceReference,
+          Status: 'DRAFT',
         },
       ],
     };
