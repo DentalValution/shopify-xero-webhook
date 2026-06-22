@@ -253,6 +253,23 @@ export async function POST(request) {
       return lineItem;
     });
 
+    // --- Add shipping as its own line item, if the order has shipping cost ---
+    // Shopify exposes this via shipping_lines (one entry per shipping rate selected)
+    if (Array.isArray(order.shipping_lines) && order.shipping_lines.length > 0) {
+      for (const shippingLine of order.shipping_lines) {
+        const shippingPrice = parseFloat(shippingLine.price) || 0;
+        if (shippingPrice > 0) {
+          lineItems.push({
+            Description: shippingLine.title ? `Shipping — ${shippingLine.title}` : 'Shipping',
+            Quantity: 1,
+            UnitAmount: shippingPrice,
+            AccountCode: ACCOUNT_GST_FREE,
+            TaxType: TAX_TYPE_GST_FREE,
+          });
+        }
+      }
+    }
+
     if (lineItems.length === 0) {
       return NextResponse.json({ error: 'Order has no line items' }, { status: 400 });
     }
