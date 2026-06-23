@@ -1,11 +1,71 @@
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 import crypto from 'crypto';
+import { GoogleSpreadsheet } from 'google-spreadsheet';
+import { JWT } from 'google-auth-library';
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
+
+// ============================================================
+// FAILURE LOGGING — Redis + Google Sheets
+// ============================================================
+
+// Stores the failed order in Redis so it can be retried later.
+// Key format: failed_order:{order_number}:{timestamp}
+async function logFailureToRedis(order, errorMessage) {
+  try {
+    const key = `failed_order:${order?.order_number || 'unknown'}:${Date.now()}`;
+    await redis.set(
+      key,
+      JSON.stringify({
+        orderNumber: order?.name || 'unknown',
+        customerEmail: order?.email || '',
+        errorMessage,
+        orderData: order,
+        timestamp: new Date().toISOString(),
+        retried: false,
+      })
+    );
+    // Keep a running list of failed order keys for easy lookup later
+    await redis.lpush('failed_orders_list', key);
+  } catch (e) {
+    console.error('Failed to log error to Redis:', e);
+  }
+}
+
+// Appends a row to the Google Sheet error log.
+async function logFailureToSheet(order, errorMessage) {
+  try {
+    const serviceAccountAuth = new JWT({
+      email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      key: process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+
+    const doc = new GoogleSpreadsheet(process.env.GOOGLE_SHEET_ID, serviceAccountAuth);
+    await doc.loadInfo();
+    const sheet = doc.sheetsByIndex[0];
+
+    await sheet.addRow({
+      Timestamp: new Date().toISOString(),
+      'Order Number': order?.name || 'unknown',
+      'Customer Email': order?.email || '',
+      'Error Message': errorMessage,
+      'Order JSON': JSON.stringify(order || {}).slice(0, 5000), // truncate to avoid huge cells
+      Retried: 'No',
+    });
+  } catch (e) {
+    console.error('Failed to log error to Google Sheet:', e);
+  }
+}
+
+// Calls both loggers together — used at every failure point
+async function logFailure(order, errorMessage) {
+  await Promise.all([logFailureToRedis(order, errorMessage), logFailureToSheet(order, errorMessage)]);
+}
 
 // ============================================================
 // DISCOUNT CONFIG
@@ -271,6 +331,7 @@ export async function POST(request) {
     }
 
     if (lineItems.length === 0) {
+      await logFailure(order, 'Order has no line items');
       return NextResponse.json({ error: 'Order has no line items' }, { status: 400 });
     }
 
@@ -346,6 +407,7 @@ export async function POST(request) {
 
     if (!invoiceResponse.ok) {
       console.error('Xero invoice creation failed:', invoiceData);
+      await logFailure(order, 'Xero invoice creation failed: ' + JSON.stringify(invoiceData).slice(0, 1000));
       return NextResponse.json({ error: 'Xero invoice creation failed', details: invoiceData }, { status: 500 });
     }
 
@@ -365,6 +427,7 @@ export async function POST(request) {
     });
   } catch (err) {
     console.error('Webhook processing error:', err);
+    await logFailure(order, err.message);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
